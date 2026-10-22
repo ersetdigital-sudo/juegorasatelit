@@ -1,0 +1,32 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+/.npm-cache
+/.localappdata
+
+# next.js
+/.next/
+/out/
+/shots/
+/scripts/
+
+# preview & local tooling
+/preview/
+/.commandcode/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+*.log
+
+# local env files
+.env*
+!.env.example
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
