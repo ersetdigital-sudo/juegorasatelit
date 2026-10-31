@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { ChevronRight, Clock3, LockKeyhole, Zap } from "lucide-react";
 import { ServiceIcon } from "@/components/service-icon";
 import { ServiceForm } from "@/components/service-form";
+import { getHydratedService } from "@/lib/catalog-hydrate";
 import { getService, services } from "@/lib/data";
 
 type PageProps = {
@@ -33,7 +34,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 
 export default async function ServiceDetailPage({ params }: PageProps) {
   const { slug } = await params;
-  const service = getService(slug);
+  const service = await getHydratedService(slug);
   if (!service) notFound();
 
   return (

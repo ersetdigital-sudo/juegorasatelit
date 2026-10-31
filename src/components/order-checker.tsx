@@ -1,29 +1,45 @@
 "use client";
 
 import { FormEvent, useState } from "react";
-import { CheckCircle2, ReceiptText, Search } from "lucide-react";
-import { demoOrders, type StoredOrder } from "@/lib/data";
+import { CheckCircle2, Loader2, ReceiptText, Search } from "lucide-react";
 import { formatDateTime, formatRupiah } from "@/lib/format";
 
-function readStoredOrders(): StoredOrder[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem("juegora_orders");
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
+type PublicStatus = "menunggu" | "diproses" | "selesai" | "gagal";
+
+type PublicOrder = {
+  invoice: string;
+  status: PublicStatus;
+  service: string;
+  product: string;
+  number: string;
+  total: number;
+  method: string;
+  channel: string;
+  createdAt: string;
+  sn: string | null;
+};
+
+const STATUS_META: Record<
+  PublicStatus,
+  { label: string; className: string }
+> = {
+  menunggu: {
+    label: "Menunggu pembayaran",
+    className: "status-menunggu-pembayaran",
+  },
+  diproses: { label: "Sedang diproses", className: "status-diproses" },
+  selesai: { label: "Selesai", className: "status-selesai" },
+  gagal: { label: "Dibatalkan", className: "status-gagal" },
+};
 
 export function OrderChecker({ showCopy = true }: { showCopy?: boolean }) {
   const [invoice, setInvoice] = useState("");
-  const [order, setOrder] = useState<StoredOrder | null>(null);
+  const [order, setOrder] = useState<PublicOrder | null>(null);
   const [error, setError] = useState("");
   const [checked, setChecked] = useState(false);
+  const [loading, setLoading] = useState(false);
 
-  function check(value: string) {
+  async function check(value: string) {
     const needle = value.trim().toUpperCase();
     if (!needle) {
       setError("Masukkan nomor invoice terlebih dahulu.");
@@ -31,26 +47,42 @@ export function OrderChecker({ showCopy = true }: { showCopy?: boolean }) {
       setChecked(false);
       return;
     }
-
-    const all = [...readStoredOrders(), ...demoOrders];
-    const found = all.find((item) => item.invoice.toUpperCase() === needle);
-
-    if (!found) {
+    if (!/^JGS-[A-Z0-9-]{4,}$/i.test(needle)) {
+      setError("Format invoice belum tepat. Contoh: JGS-YYMMDD-XXXXXX.");
       setOrder(null);
-      setError("Invoice tidak ditemukan. Periksa kembali nomor invoice kamu.");
-      setChecked(true);
+      setChecked(false);
       return;
     }
 
-    setOrder(found);
     setError("");
-    setChecked(true);
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/orders/${encodeURIComponent(needle)}`, {
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) {
+        setOrder(null);
+        setError("Invoice tidak ditemukan. Periksa kembali nomor invoice kamu.");
+        setChecked(true);
+        return;
+      }
+      setOrder((await response.json()) as PublicOrder);
+      setChecked(true);
+    } catch {
+      setOrder(null);
+      setError("Gagal memeriksa status. Coba lagi sebentar.");
+      setChecked(true);
+    } finally {
+      setLoading(false);
+    }
   }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    check(invoice);
+    void check(invoice);
   }
+
+  const meta = order ? STATUS_META[order.status] : null;
 
   return (
     <div className={`tracker-panel ${showCopy ? "" : "tracker-panel--form"}`.trim()} id="cek-pesanan">
@@ -64,10 +96,10 @@ export function OrderChecker({ showCopy = true }: { showCopy?: boolean }) {
           </p>
           <div className="tracker-perks">
             <span>
-              <CheckCircle2 size={13} /> Status diperbarui otomatis
+              <CheckCircle2 size={13} /> Status real-time dari server
             </span>
             <span>
-              <CheckCircle2 size={13} /> Riwayat tersimpan di perangkat ini
+              <CheckCircle2 size={13} /> Bisa dicek kapan saja
             </span>
             <span>
               <CheckCircle2 size={13} /> Bantuan CS 24 jam
@@ -89,29 +121,27 @@ export function OrderChecker({ showCopy = true }: { showCopy?: boolean }) {
                 setInvoice(event.target.value.toUpperCase());
                 if (error) setError("");
               }}
-              placeholder="Contoh: JSR-2610-0812"
+              placeholder="Contoh: JGS-2610-0812"
               aria-label="Nomor invoice"
               autoComplete="off"
             />
           </div>
-          <button type="submit" className="btn btn-primary">
-            <Search size={15} />
-            Cek
+          <button type="submit" className="btn btn-primary" disabled={loading}>
+            {loading ? <Loader2 className="spin" size={15} /> : <Search size={15} />}
+            {loading ? "Mencari…" : "Cek"}
           </button>
         </form>
 
         {error && <p className="tracker-error">{error}</p>}
 
-        {checked && order && (
+        {checked && order && meta && (
           <div className="tracker-result">
             <div className="tracker-result-head">
               <div>
                 <strong>{order.invoice}</strong>
                 <span>{formatDateTime(order.createdAt)}</span>
               </div>
-              <div className={`tracker-status status-${order.status.toLowerCase().replaceAll(" ", "-")}`}>
-                {order.status}
-              </div>
+              <div className={`tracker-status ${meta.className}`}>{meta.label}</div>
             </div>
             <div className="tracker-detail-row">
               <span>Layanan</span>
@@ -133,6 +163,12 @@ export function OrderChecker({ showCopy = true }: { showCopy?: boolean }) {
               <span>Total</span>
               <span>{formatRupiah(order.total)}</span>
             </div>
+            {order.sn && (
+              <div className="tracker-detail-row">
+                <span>SN / Token</span>
+                <span className="select-all font-semibold">{order.sn}</span>
+              </div>
+            )}
           </div>
         )}
       </div>

@@ -4,10 +4,10 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 import { ArrowUpRight, Search, X } from "lucide-react";
 import { ServiceIcon } from "@/components/service-icon";
-import { categories, services, type CategoryId } from "@/lib/data";
+import { categories, type CategoryId, type Service } from "@/lib/data";
 import { formatRupiah } from "@/lib/format";
 
-export function ServiceCatalog() {
+export function ServiceCatalog({ services }: { services: Service[] }) {
   const [category, setCategory] = useState<CategoryId>("semua");
   const [query, setQuery] = useState("");
 
@@ -22,7 +22,7 @@ export function ServiceCatalog() {
         .toLowerCase();
       return haystack.includes(needle);
     });
-  }, [category, query]);
+  }, [category, query, services]);
 
   return (
     <div>

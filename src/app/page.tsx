@@ -20,6 +20,7 @@ import { PromoCountdown } from "@/components/promo-countdown";
 import { ServiceCatalog } from "@/components/service-catalog";
 import { SiteFooter } from "@/components/site-footer";
 import { TransactionFeed } from "@/components/transaction-feed";
+import { getHydratedServices } from "@/lib/catalog-hydrate";
 import { testimonials } from "@/lib/data";
 
 const steps = [
@@ -63,7 +64,9 @@ const paymentLogos = [
   { name: "GoPay", src: "/images/payments/gopay.png" },
 ];
 
-export default function HomePage() {
+export default async function HomePage() {
+  const services = await getHydratedServices();
+
   return (
     <>
       <section className="hero grid-bg">
@@ -219,7 +222,7 @@ export default function HomePage() {
               8 kategori aktif
             </div>
           </div>
-          <ServiceCatalog />
+          <ServiceCatalog services={services} />
         </div>
       </section>
 

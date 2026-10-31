@@ -36,15 +36,6 @@ export function normalizeWhatsapp(value: string) {
   return digits;
 }
 
-export function makeInvoice() {
-  const now = new Date();
-  const yy = String(now.getFullYear()).slice(-2);
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
-  const random = String(Math.floor(1000 + Math.random() * 9000));
-  return `JSR-${yy}${mm}${dd}-${random}`;
-}
-
 export function formatDateTime(value: string) {
   return new Intl.DateTimeFormat("id-ID", {
     day: "2-digit",

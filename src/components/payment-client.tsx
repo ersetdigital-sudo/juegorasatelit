@@ -1,7 +1,6 @@
 "use client";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   ArrowRight,
@@ -25,27 +24,49 @@ import {
   X,
 } from "lucide-react";
 import { ServiceIcon } from "@/components/service-icon";
-import {
-  getProduct,
-  getService,
-  paymentMethods,
-  promoCodes,
-  type PaymentMethod,
-  type PromoCode,
-  type StoredOrder,
-} from "@/lib/data";
-import {
-  formatPhone,
-  formatRupiah,
-  makeInvoice,
-} from "@/lib/format";
+import type { Product, Service } from "@/lib/data";
+import { formatPhone, formatRupiah } from "@/lib/format";
+import { checkVoucher, createOrder, getPayment } from "@/lib/db/client";
+import { toPublicError } from "@/lib/db/errors";
+import type { PaymentInfo } from "@/lib/db/types";
 
 type Stage = "form" | "invoice";
 type Status = "Menunggu pembayaran" | "Diproses";
 
-const TIMER_MS = 15 * 60 * 1000;
-const QRIS_IMAGE =
-  "https://res.cloudinary.com/dqjh7utdb/image/upload/v1792161327/camhvfeu1lcm0ps8ieiz.jpg";
+type CheckoutMethod = {
+  id: string;
+  name: string;
+  fee: number;
+  type: "qr" | "ewallet" | "va";
+};
+
+type AppliedVoucher = {
+  code: string;
+  potongan: number;
+  label: string;
+};
+
+const METHOD_LOGOS: Record<string, string> = {
+  QRIS: "/images/payments/qris.png",
+  DANA: "/images/payments/dana.svg",
+  OVO: "/images/payments/ovo.svg",
+  GoPay: "/images/payments/gopay.png",
+  ShopeePay: "/images/payments/shopeepay.svg",
+  "BCA Virtual Account": "/images/payments/bca.svg",
+  "BRI Virtual Account": "/images/payments/bri.svg",
+  "Mandiri Virtual Account": "/images/payments/mandiri.svg",
+  "BNI Virtual Account": "/images/payments/bni.svg",
+};
+
+function methodLogo(name: string) {
+  return METHOD_LOGOS[name] ?? "/images/payments/qris.png";
+}
+
+function methodNote(name: string) {
+  return name === "QRIS"
+    ? "Scan sekali, semua e-wallet & m-banking"
+    : `Bayar lewat ${name}`;
+}
 
 function pad(value: number) {
   return String(value).padStart(2, "0");
@@ -56,44 +77,66 @@ function formatRemaining(ms: number) {
   return `${pad(Math.floor(safe / 60000))}:${pad(Math.floor((safe % 60000) / 1000))}`;
 }
 
-export function PaymentClient() {
-  const searchParams = useSearchParams();
-  const serviceSlug = searchParams.get("service") ?? "";
-  const productId = searchParams.get("product") ?? "";
-  const service = getService(serviceSlug);
-  const product = getProduct(serviceSlug, productId);
-  const number = searchParams.get("no") ?? "";
-  const months = Math.min(6, Math.max(1, Number(searchParams.get("months") ?? 1) || 1));
-  const region = searchParams.get("region") ?? "";
-  const provider = searchParams.get("provider") ?? "";
-  const finance = searchParams.get("finance") ?? "";
-  const wallet = searchParams.get("wallet") ?? "";
-
-  const [methodId, setMethodId] = useState("qris");
-  const [methodTab, setMethodTab] = useState<PaymentMethod["type"]>("qris");
+export function PaymentClient({
+  service,
+  product,
+  dbServiceId,
+  dbProductId,
+  brandSlug,
+  methods,
+  qrisImageUrl,
+  number,
+  months,
+  region,
+  provider,
+  finance,
+  wallet,
+}: {
+  service: Service | null;
+  product: Product | null;
+  dbServiceId: string | null;
+  dbProductId: string | null;
+  brandSlug: string;
+  methods: CheckoutMethod[];
+  qrisImageUrl: string | null;
+  number: string;
+  months: number;
+  region: string;
+  provider: string;
+  finance: string;
+  wallet: string;
+}) {
+  const serviceSlug = service?.slug ?? "";
+  const [methodId, setMethodId] = useState(methods[0]?.id ?? "");
+  const [methodTab, setMethodTab] = useState<CheckoutMethod["type"]>(
+    methods[0]?.type ?? "qr",
+  );
   const [promoInput, setPromoInput] = useState("");
-  const [appliedPromo, setAppliedPromo] = useState<PromoCode | null>(null);
+  const [appliedVoucher, setAppliedVoucher] = useState<AppliedVoucher | null>(null);
   const [promoError, setPromoError] = useState("");
   const [applyingPromo, setApplyingPromo] = useState(false);
   const [stage, setStage] = useState<Stage>("form");
   const [invoice, setInvoice] = useState("");
   const [createdAt, setCreatedAt] = useState<number>(0);
   const [expiresAt, setExpiresAt] = useState<number>(0);
-  const [remaining, setRemaining] = useState(TIMER_MS);
+  const [remaining, setRemaining] = useState(0);
   const [status, setStatus] = useState<Status>("Menunggu pembayaran");
   const [copied, setCopied] = useState("");
+  const [paying, setPaying] = useState(false);
+  const [payError, setPayError] = useState("");
+  const [paymentDetail, setPaymentDetail] = useState<PaymentInfo | null>(null);
+  const [orderTotal, setOrderTotal] = useState(0);
 
-  const method = paymentMethods.find((item) => item.id === methodId) ?? paymentMethods[0];
-  const basePrice = (product?.price ?? 0) * (serviceSlug === "bpjs" ? months : 1);
-  const discount = appliedPromo
-    ? appliedPromo.type === "percent"
-      ? Math.min(
-          Math.round((basePrice * appliedPromo.value) / 100),
-          appliedPromo.maxDiscount ?? Number.POSITIVE_INFINITY,
-        )
-      : Math.min(appliedPromo.value, basePrice)
-    : 0;
-  const total = Math.max(0, basePrice + method.fee - discount);
+  const method = methods.find((item) => item.id === methodId) ?? methods[0];
+  const availableTabs = useMemo(
+    () => Array.from(new Set(methods.map((item) => item.type))),
+    [methods],
+  );
+  const basePrice = product?.price ?? 0;
+  const discount = appliedVoucher?.potongan ?? 0;
+  const total = Math.max(0, basePrice + (method?.fee ?? 0) - discount);
+  const displayTotal = stage === "invoice" && orderTotal > 0 ? orderTotal : total;
+  const totalWindow = Math.max(1, expiresAt - createdAt);
   const expired = stage === "invoice" && remaining <= 0 && status === "Menunggu pembayaran";
 
   useEffect(() => {
@@ -112,15 +155,15 @@ export function PaymentClient() {
     return number.replace(/(\d{4})(?=\d)/g, "$1 ").trim();
   }, [number, serviceSlug]);
 
-  if (!service || !product) {
+  if (!service || !product || !method) {
     return (
       <div className="container">
         <div className="order-not-found panel">
           <TriangleAlert size={28} style={{ margin: "0 auto 12px", color: "var(--orange)" }} />
           <h1>Pesanan tidak ditemukan</h1>
           <p>
-            Detail pesanan belum lengkap. Silakan pilih layanan dan produk terlebih dahulu dari
-            halaman utama.
+            Detail pesanan atau metode pembayaran belum lengkap. Silakan pilih layanan dan produk
+            terlebih dahulu dari halaman utama.
           </p>
           <Link href="/#layanan" className="btn btn-primary">
             Pilih layanan
@@ -131,84 +174,112 @@ export function PaymentClient() {
     );
   }
 
-  function changeMethodTab(tab: PaymentMethod["type"]) {
+  function changeMethodTab(tab: CheckoutMethod["type"]) {
     setMethodTab(tab);
-    const first = paymentMethods.find((item) => item.type === tab);
+    const first = methods.find((item) => item.type === tab);
     if (first) setMethodId(first.id);
   }
 
-  function applyPromo(codeOverride?: string) {
+  async function applyPromo(codeOverride?: string) {
     const code = (codeOverride ?? promoInput).trim().toUpperCase();
     setPromoError("");
     if (!code) {
       setPromoError("Masukkan kode promo terlebih dahulu.");
       return;
     }
-
-    const promo = promoCodes.find((item) => item.code === code);
-    if (!promo) {
-      setPromoError("Kode promo tidak ditemukan.");
-      return;
-    }
-    if (promo.minSpend && basePrice < promo.minSpend) {
-      setPromoError(`Minimal transaksi ${formatRupiah(promo.minSpend)} untuk kode ini.`);
+    if (!dbServiceId) {
+      setPromoError("Pembayaran belum tersedia. Coba lagi sebentar.");
       return;
     }
 
     setApplyingPromo(true);
-    window.setTimeout(() => {
-      setAppliedPromo(promo);
-      setPromoInput(promo.code);
+    try {
+      const result = await checkVoucher({
+        brandSlug,
+        code,
+        serviceId: dbServiceId,
+        subtotal: basePrice,
+      });
+      if (!result.valid) {
+        setPromoError(result.pesan || "Kode promo tidak valid.");
+        return;
+      }
+      setAppliedVoucher({
+        code,
+        potongan: result.potongan,
+        label: `Potongan ${formatRupiah(result.potongan)}`,
+      });
+      setPromoInput(code);
+    } catch (error) {
+      setPromoError(toPublicError(error).message);
+    } finally {
       setApplyingPromo(false);
-    }, 450);
+    }
   }
 
   function removePromo() {
-    setAppliedPromo(null);
+    setAppliedVoucher(null);
     setPromoInput("");
     setPromoError("");
   }
 
-  function saveOrder(next: StoredOrder) {
-    try {
-      const raw = window.localStorage.getItem("juegora_orders");
-      const existing = raw ? JSON.parse(raw) : [];
-      const list = Array.isArray(existing) ? existing : [];
-      const withoutDuplicate = list.filter((item: StoredOrder) => item.invoice !== next.invoice);
-      window.localStorage.setItem(
-        "juegora_orders",
-        JSON.stringify([next, ...withoutDuplicate].slice(0, 40)),
-      );
-    } catch {
-      // Penyimpanan lokal tidak tersedia; transaksi tetap berjalan di sesi ini.
-    }
-  }
-
-  function handlePay(event: FormEvent) {
+  async function handlePay(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (
+      !service ||
+      !product ||
+      !method ||
+      !dbServiceId ||
+      !dbProductId ||
+      !brandSlug ||
+      !number.trim()
+    ) {
+      setPayError("Pembayaran belum tersedia. Periksa kembali data pesanan.");
+      return;
+    }
 
-    const nextInvoice = makeInvoice();
-    const now = Date.now();
-    setInvoice(nextInvoice);
-    setCreatedAt(now);
-    setExpiresAt(now + TIMER_MS);
-    setRemaining(TIMER_MS);
-    setStage("invoice");
-    setStatus("Menunggu pembayaran");
+    setPayError("");
+    setPaying(true);
+    try {
+      const input: Record<string, string> = { nomor_tujuan: number };
+      if (months > 1) input.months = String(months);
+      if (region) input.region = region;
+      if (provider) input.provider = provider;
+      if (finance) input.finance = finance;
+      if (wallet) input.wallet = wallet;
 
-    const order: StoredOrder = {
-      invoice: nextInvoice,
-      service: service!.name,
-      product:
-        serviceSlug === "bpjs" ? `${product!.name} · ${months} bulan` : product!.name,
-      number: phoneDisplay,
-      total,
-      method: method.name,
-      status: "Menunggu pembayaran",
-      createdAt: new Date(now).toISOString(),
-    };
-    saveOrder(order);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+      const created = await createOrder({
+        brandSlug,
+        serviceId: dbServiceId,
+        productId: dbProductId,
+        nomorTujuan: number,
+        input,
+        paymentMethodId: method.id,
+        voucherCode: appliedVoucher?.code ?? null,
+      });
+
+      let detail: PaymentInfo | null = null;
+      try {
+        detail = await getPayment(created.ref);
+      } catch {
+        detail = null;
+      }
+
+      const end = new Date(created.expires_at).getTime();
+      setPaymentDetail(detail);
+      setOrderTotal(detail?.total ?? created.total);
+      setInvoice(created.ref);
+      setCreatedAt(detail?.created_at ? new Date(detail.created_at).getTime() : Date.now());
+      setExpiresAt(end);
+      setRemaining(Math.max(0, end - Date.now()));
+      setStage("invoice");
+      setStatus("Menunggu pembayaran");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (error) {
+      setPayError(toPublicError(error).message);
+    } finally {
+      setPaying(false);
+    }
   }
 
   function copyValue(value: string, key: string) {
@@ -221,30 +292,17 @@ export function PaymentClient() {
 
   function confirmPaid() {
     setStatus("Diproses");
-    const order: StoredOrder = {
-      invoice,
-      service: service!.name,
-      product:
-        serviceSlug === "bpjs" ? `${product!.name} · ${months} bulan` : product!.name,
-      number: phoneDisplay,
-      total,
-      method: method.name,
-      status: "Diproses",
-      createdAt: new Date(createdAt).toISOString(),
-      paidAt: new Date().toISOString(),
-    };
-    saveOrder(order);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  const vaNumber = method.type === "va" ? buildVaNumber(invoice || "JSR-0000", method.id) : "";
+  const vaNumber = method.type === "va" ? buildVaNumber(invoice || "JGS-0000", method.id) : "";
   const steps =
-    method.type === "qris"
+    method.type === "qr"
       ? [
           "Buka aplikasi m-banking atau e-wallet yang mendukung QRIS.",
           "Pilih menu Scan QR, lalu arahkan kamera ke kode QR di samping.",
           "Periksa nominal dan nama merchant Juegora Satelit, lalu konfirmasi.",
-          "Pembayaran otomatis terverifikasi dan pesanan langsung diproses.",
+          "Setelah kamu konfirmasi, admin mencocokkan pembayaran lalu memproses pesanan.",
         ]
       : method.type === "ewallet"
         ? [
@@ -298,48 +356,54 @@ export function PaymentClient() {
                   </div>
 
                   <div className="pay-tabs" role="tablist" aria-label="Jenis metode pembayaran">
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={methodTab === "qris"}
-                      className={`pay-tab ${methodTab === "qris" ? "is-active" : ""}`}
-                      onClick={() => changeMethodTab("qris")}
-                    >
-                      <QrCode size={13} />
-                      QRIS
-                    </button>
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={methodTab === "ewallet"}
-                      className={`pay-tab ${methodTab === "ewallet" ? "is-active" : ""}`}
-                      onClick={() => changeMethodTab("ewallet")}
-                    >
-                      <Wallet size={13} />
-                      E-Wallet
-                    </button>
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={methodTab === "va"}
-                      className={`pay-tab ${methodTab === "va" ? "is-active" : ""}`}
-                      onClick={() => changeMethodTab("va")}
-                    >
-                      <CreditCard size={13} />
-                      Virtual Account
-                    </button>
+                    {availableTabs.includes("qr") && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={methodTab === "qr"}
+                        className={`pay-tab ${methodTab === "qr" ? "is-active" : ""}`}
+                        onClick={() => changeMethodTab("qr")}
+                      >
+                        <QrCode size={13} />
+                        QRIS
+                      </button>
+                    )}
+                    {availableTabs.includes("ewallet") && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={methodTab === "ewallet"}
+                        className={`pay-tab ${methodTab === "ewallet" ? "is-active" : ""}`}
+                        onClick={() => changeMethodTab("ewallet")}
+                      >
+                        <Wallet size={13} />
+                        E-Wallet
+                      </button>
+                    )}
+                    {availableTabs.includes("va") && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={methodTab === "va"}
+                        className={`pay-tab ${methodTab === "va" ? "is-active" : ""}`}
+                        onClick={() => changeMethodTab("va")}
+                      >
+                        <CreditCard size={13} />
+                        Virtual Account
+                      </button>
+                    )}
                   </div>
 
                   <div className="method-panel" key={methodTab}>
-                    {methodTab === "qris" ? (
+                    {methodTab === "qr" ? (
                       <div className="method-group">
                         <div className="method-group-title">
                           <QrCode size={11} />
                           Scan & bayar
                           <span>instan · tanpa biaya admin</span>
                         </div>
-                        {paymentMethods
-                          .filter((item) => item.type === "qris")
+                        {methods
+                          .filter((item) => item.type === "qr")
                           .map((item) => (
                             <button
                               type="button"
@@ -350,11 +414,11 @@ export function PaymentClient() {
                             >
                               <span className="recommend-badge">Disarankan</span>
                               <span className="method-logo">
-                                <img src={item.logo} alt={item.name} />
+                                <img src={methodLogo(item.name)} alt={item.name} />
                               </span>
                               <span className="method-copy">
                                 <strong>{item.name}</strong>
-                                <span>{item.note}</span>
+                                <span>{methodNote(item.name)}</span>
                               </span>
                               <span className="radio-mark">
                                 <Check size={9} strokeWidth={3} />
@@ -369,11 +433,13 @@ export function PaymentClient() {
                           {methodTab === "ewallet" ? "E-Wallet" : "Virtual Account"}
                           <span>
                             biaya admin{" "}
-                            {methodTab === "ewallet" ? "Rp 1.500" : "Rp 2.500"}
+                            {formatRupiah(
+                              methods.find((item) => item.type === methodTab)?.fee ?? 0,
+                            )}
                           </span>
                         </div>
                         <div className="method-grid">
-                          {paymentMethods
+                          {methods
                             .filter((item) => item.type === methodTab)
                             .map((item) => (
                               <MethodOption
@@ -398,14 +464,14 @@ export function PaymentClient() {
                     <span className="step-badge">02</span>
                   </div>
 
-                  {appliedPromo ? (
+                  {appliedVoucher ? (
                     <div className="promo-success">
                       <span className="promo-success-icon">
                         <BadgeCheck size={16} />
                       </span>
                       <div>
-                        <strong>{appliedPromo.code} berhasil dipakai</strong>
-                        <span>{appliedPromo.label}</span>
+                        <strong>{appliedVoucher.code} berhasil dipakai</strong>
+                        <span>{appliedVoucher.label}</span>
                       </div>
                       <button type="button" onClick={removePromo} aria-label="Hapus kode promo">
                         <X size={13} />
@@ -428,7 +494,7 @@ export function PaymentClient() {
                             onKeyDown={(event) => {
                               if (event.key === "Enter") {
                                 event.preventDefault();
-                                applyPromo();
+                                void applyPromo();
                               }
                             }}
                             placeholder="Masukkan kode promo"
@@ -438,7 +504,7 @@ export function PaymentClient() {
                         <button
                           type="button"
                           className="btn btn-ghost"
-                          onClick={() => applyPromo()}
+                          onClick={() => void applyPromo()}
                           disabled={applyingPromo}
                         >
                           {applyingPromo ? <Loader2 className="spin" size={14} /> : "Pakai"}
@@ -447,7 +513,7 @@ export function PaymentClient() {
                       {promoError && <p className="field-error">{promoError}</p>}
                       <p className="promo-hint">
                         Coba{" "}
-                        <button type="button" onClick={() => applyPromo("JUE20")}>
+                        <button type="button" onClick={() => void applyPromo("JUE20")}>
                           JUE20
                         </button>{" "}
                         — diskon 20% maksimal Rp 20.000.
@@ -463,11 +529,24 @@ export function PaymentClient() {
                 </div>
 
                 <div className="pay-button-wrap">
-                  <button type="submit" className="btn btn-primary btn-block btn-lg">
-                    <LockKeyhole size={16} />
-                    Bayar {formatRupiah(total)}
-                    <ArrowRight size={17} />
+                  <button
+                    type="submit"
+                    className="btn btn-primary btn-block btn-lg"
+                    disabled={paying}
+                  >
+                    {paying ? (
+                      <Loader2 className="spin" size={16} />
+                    ) : (
+                      <LockKeyhole size={16} />
+                    )}
+                    {paying ? "Memproses…" : `Bayar ${formatRupiah(total)}`}
+                    {!paying && <ArrowRight size={17} />}
                   </button>
+                  {payError && (
+                    <p className="field-error" role="alert">
+                      {payError}
+                    </p>
+                  )}
                 </div>
               </form>
             ) : (
@@ -477,7 +556,7 @@ export function PaymentClient() {
                   serviceSlug === "bpjs" ? `${product.name} · ${months} bulan` : product.name
                 }
                 invoice={invoice}
-                total={total}
+                total={displayTotal}
                 method={method}
                 status={status}
                 expired={expired}
@@ -486,6 +565,7 @@ export function PaymentClient() {
                 steps={steps}
                 createdAt={createdAt}
                 copied={copied}
+                qrisImageUrl={paymentDetail?.qris_image_url ?? qrisImageUrl}
                 onCopy={copyValue}
                 onConfirmPaid={confirmPaid}
               />
@@ -497,10 +577,10 @@ export function PaymentClient() {
               <div className="timer-card">
                 <div className="timer-card-label">
                   <Timer size={11} />
-                  {status === "Diproses" ? "Pembayaran terverifikasi" : expired ? "Waktu habis" : "Selesaikan dalam"}
+                  {status === "Diproses" ? "Pembayaran dicek admin" : expired ? "Waktu habis" : "Selesaikan dalam"}
                 </div>
                 <div className="timer-big">
-                  {status === "Diproses" ? "LUNAS" : formatRemaining(expired ? 0 : remaining)}
+                  {status === "Diproses" ? "DIPROSES" : formatRemaining(expired ? 0 : remaining)}
                   <small>{status === "Diproses" ? "" : "menit"}</small>
                 </div>
                 <div className="timer-progress">
@@ -509,14 +589,14 @@ export function PaymentClient() {
                       width:
                         status === "Diproses"
                           ? "100%"
-                          : `${Math.max(0, Math.min(100, (remaining / TIMER_MS) * 100))}%`,
+                          : `${Math.max(0, Math.min(100, (remaining / totalWindow) * 100))}%`,
                     }}
                   />
                 </div>
                 <p className="simulation-note">
                   <Info size={10} />
                   {status === "Diproses"
-                    ? "Pembayaran diterima, pesanan sedang diproses."
+                    ? "Pembayaran sedang diperiksa admin."
                     : "Selesaikan pembayaran sebelum waktu habis"}
                 </p>
               </div>
@@ -564,10 +644,10 @@ export function PaymentClient() {
                     <span>-{formatRupiah(discount)}</span>
                   </div>
                 )}
-                {appliedPromo && (
+                {appliedVoucher && (
                   <div className="summary-row summary-promo-code">
                     <span>Kode promo</span>
-                    <span>{appliedPromo.code}</span>
+                    <span>{appliedVoucher.code}</span>
                   </div>
                 )}
                 {region && (
@@ -598,7 +678,7 @@ export function PaymentClient() {
 
               <div className="summary-total">
                 <span>Total pembayaran</span>
-                <strong>{formatRupiah(total)}</strong>
+                <strong>{formatRupiah(displayTotal)}</strong>
               </div>
 
               {stage === "invoice" ? (
@@ -610,13 +690,13 @@ export function PaymentClient() {
                     disabled={status === "Diproses" || expired}
                   >
                     <CheckCircle2 size={15} />
-                    {status === "Diproses" ? "Sudah dibayar" : "Saya sudah bayar"}
+                    {status === "Diproses" ? "Sedang dicek admin" : "Saya sudah bayar"}
                   </button>
                 </div>
               ) : (
                 <div className="pay-summary-badge">
                   <ShieldCheck size={12} />
-                  Pembayaran diverifikasi otomatis. Total sudah termasuk biaya admin.
+                  Pembayaran diverifikasi admin. Total sudah termasuk biaya admin.
                 </div>
               )}
 
@@ -674,7 +754,7 @@ function MethodOption({
   selected,
   onSelect,
 }: {
-  item: PaymentMethod;
+  item: CheckoutMethod;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -686,11 +766,11 @@ function MethodOption({
       aria-pressed={selected}
     >
       <span className="method-logo">
-        <img src={item.logo} alt={item.name} />
+        <img src={methodLogo(item.name)} alt={item.name} />
       </span>
       <span className="method-copy">
         <strong>{item.name}</strong>
-        <span>{item.note}</span>
+        <span>{methodNote(item.name)}</span>
       </span>
       <span className="radio-mark">
         <Check size={9} strokeWidth={3} />
@@ -712,14 +792,15 @@ function InvoiceView({
   steps,
   createdAt,
   copied,
+  qrisImageUrl,
   onCopy,
   onConfirmPaid,
 }: {
-  service: ReturnType<typeof getService>;
+  service: Service | null;
   productName: string;
   invoice: string;
   total: number;
-  method: PaymentMethod;
+  method: CheckoutMethod;
   status: Status;
   expired: boolean;
   remaining: number;
@@ -727,6 +808,7 @@ function InvoiceView({
   steps: string[];
   createdAt: number;
   copied: string;
+  qrisImageUrl: string | null;
   onCopy: (value: string, key: string) => void;
   onConfirmPaid: () => void;
 }) {
@@ -739,7 +821,7 @@ function InvoiceView({
         <div className="invoice-top">
           <span className={`status-chip ${paid ? "is-paid" : ""}`}>
             <span className="live-dot" />
-            {paid ? "Pembayaran diterima" : expired ? "Kedaluwarsa" : "Menunggu pembayaran"}
+            {paid ? "Menunggu verifikasi admin" : expired ? "Kedaluwarsa" : "Menunggu pembayaran"}
           </span>
           {!paid && (
             <span className="timer-mini">
@@ -768,9 +850,13 @@ function InvoiceView({
         </div>
 
         <div className="invoice-body">
-          {method.type === "qris" && (
+          {method.type === "qr" && (
             <div className="qr-wrap">
-              <img className="qr-image" src={QRIS_IMAGE} alt="Kode QRIS Juegora Satelit" />
+              {qrisImageUrl ? (
+                <img className="qr-image" src={qrisImageUrl} alt="Kode QRIS Juegora Satelit" />
+              ) : (
+                <p className="simulation-note">Kode QRIS belum tersedia. Hubungi CS.</p>
+              )}
               <span>Scan dengan app m-banking atau e-wallet kamu</span>
             </div>
           )}
@@ -778,7 +864,7 @@ function InvoiceView({
           {method.type === "va" && (
             <div className="va-box">
               <span className="method-logo">
-                <img src={method.logo} alt={method.name} />
+                <img src={methodLogo(method.name)} alt={method.name} />
               </span>
               <div className="va-label">Nomor Virtual Account</div>
               <div className="va-number-row">
@@ -794,7 +880,7 @@ function InvoiceView({
               </div>
               <p className="simulation-note">
                 <Info size={10} />
-                Transfer tepat {formatRupiah(total)} agar otomatis terverifikasi.
+                Transfer tepat {formatRupiah(total)} sesuai nominal invoice.
               </p>
             </div>
           )}
@@ -802,7 +888,7 @@ function InvoiceView({
           {method.type === "ewallet" && (
             <div className="va-box">
               <span className="method-logo">
-                <img src={method.logo} alt={method.name} />
+                <img src={methodLogo(method.name)} alt={method.name} />
               </span>
               <div className="va-label">Pembayaran via</div>
               <div className="va-number-row">
@@ -844,11 +930,11 @@ function InvoiceView({
 
         {paid ? (
           <div className="instructions">
-            <h3>Terima kasih, pembayaran Anda sedang diproses</h3>
+            <h3>Terima kasih, pembayaran sedang diperiksa admin</h3>
             <p className="wa-note" style={{ marginTop: 0 }}>
               <CheckCircle2 size={12} color="var(--success)" />
-              Pembayaran kamu sudah kami terima. Pesanan sedang diproses dan diteruskan ke mitra
-              layanan. Bukti transaksi digital tersimpan di halaman ini.
+              Konfirmasi kamu sudah kami terima. Admin akan mencocokkan pembayaran sebelum layanan
+              diproses. Status terbaru bisa dicek lewat halaman Cek Pesanan.
             </p>
           </div>
         ) : (
@@ -870,7 +956,7 @@ function InvoiceView({
             <span className="order-timeline-copy">
               <strong>Pembayaran</strong>
               <span>
-                {paid ? "Pembayaran diterima" : expired ? "Waktu pembayaran habis" : "Menunggu pembayaran"}
+                {paid ? "Pembayaran dicek admin" : expired ? "Waktu pembayaran habis" : "Menunggu pembayaran"}
               </span>
             </span>
           </div>
@@ -911,8 +997,8 @@ function InvoiceView({
 
       <p className="detail-focus-note">
         <CircleAlert size={12} />
-        Simpan halaman ini. Nomor invoice dan bukti transaksi kamu tersimpan di perangkat ini dan
-        bisa dicek kembali kapan saja.
+        Simpan nomor invoice ini. Status pembayaran dan bukti transaksi bisa dicek kembali kapan
+        saja lewat halaman Cek Pesanan.
       </p>
     </>
   );

@@ -42,7 +42,7 @@ export default function CekTransaksiPage() {
               </span>
               <span className="badge">
                 <ReceiptText size={9} />
-                Riwayat tersimpan di perangkat ini
+                Status langsung dari server
               </span>
             </div>
           </div>
